@@ -278,7 +278,6 @@ DBHandle *db_connect(const std::string &db_primary_address,
 
   db->client_type = strdup(client_type);
   db->client = client;
-  db->db_client_cache = NULL;
 
   redisAsyncContext *context;
   redisAsyncContext *subscribe_context;
@@ -324,12 +323,11 @@ void DBHandle_free(DBHandle *db) {
   }
 
   /* Clean up memory. */
-  DBClientCacheEntry *e, *tmp;
-  HASH_ITER(hh, db->db_client_cache, e, tmp) {
-    free(e->addr);
-    HASH_DELETE(hh, db->db_client_cache, e);
-    free(e);
+  for (auto it = db->db_client_cache.begin(); it != db->db_client_cache.end();
+       it = db->db_client_cache.erase(it)) {
+    free(it->second);
   }
+
   free(db->client_type);
   delete db;
 }
@@ -607,24 +605,22 @@ void redis_result_table_lookup(TableCallbackData *callback_data) {
 void redis_get_cached_db_client(DBHandle *db,
                                 DBClientID db_client_id,
                                 const char **manager) {
-  DBClientCacheEntry *entry;
-  HASH_FIND(hh, db->db_client_cache, &db_client_id, sizeof(db_client_id),
-            entry);
-  if (!entry) {
+  auto it = db->db_client_cache.find(db_client_id);
+
+  if (it == db->db_client_cache.end()) {
     /* This is a very rare case. It should happen at most once per db client. */
     redisReply *reply = (redisReply *) redisCommand(
         db->sync_context, "RAY.GET_CLIENT_ADDRESS %b", (char *) db_client_id.id,
         sizeof(db_client_id.id));
     CHECKM(reply->type == REDIS_REPLY_STRING, "REDIS reply type=%d, str=%s",
            reply->type, reply->str);
-    entry = (DBClientCacheEntry *) malloc(sizeof(DBClientCacheEntry));
-    entry->db_client_id = db_client_id;
-    entry->addr = strdup(reply->str);
-    HASH_ADD(hh, db->db_client_cache, db_client_id, sizeof(db_client_id),
-             entry);
+    char *addr = strdup(reply->str);
     freeReplyObject(reply);
+    db->db_client_cache[db_client_id] = addr;
+    *manager = addr;
+  } else {
+    *manager = it->second;
   }
-  *manager = entry->addr;
 }
 
 void redis_object_table_lookup_callback(redisAsyncContext *c,
@@ -1293,14 +1289,22 @@ void redis_local_scheduler_table_subscribe_callback(redisAsyncContext *c,
     DBClientID client_id = from_flatbuf(message->db_client_id());
     /* Extract the fields of the local scheduler info struct. */
     LocalSchedulerInfo info;
-    info.total_num_workers = message->total_num_workers();
-    info.task_queue_length = message->task_queue_length();
-    info.available_workers = message->available_workers();
-    for (int i = 0; i < ResourceIndex_MAX; ++i) {
-      info.static_resources[i] = message->static_resources()->Get(i);
-    }
-    for (int i = 0; i < ResourceIndex_MAX; ++i) {
-      info.dynamic_resources[i] = message->dynamic_resources()->Get(i);
+    memset(&info, 0, sizeof(info));
+    if (message->is_dead()) {
+      /* If the local scheduler is dead, then ignore all other fields in the
+       * message. */
+      info.is_dead = true;
+    } else {
+      /* If the local scheduler is alive, collect load information. */
+      info.total_num_workers = message->total_num_workers();
+      info.task_queue_length = message->task_queue_length();
+      info.available_workers = message->available_workers();
+      for (int i = 0; i < ResourceIndex_MAX; ++i) {
+        info.static_resources[i] = message->static_resources()->Get(i);
+      }
+      for (int i = 0; i < ResourceIndex_MAX; ++i) {
+        info.dynamic_resources[i] = message->dynamic_resources()->Get(i);
+      }
     }
 
     /* Call the subscribe callback. */
@@ -1359,7 +1363,7 @@ void redis_local_scheduler_table_send_info(TableCallbackData *callback_data) {
       fbb, to_flatbuf(fbb, db->client), info.total_num_workers,
       info.task_queue_length, info.available_workers,
       fbb.CreateVector(info.static_resources, ResourceIndex_MAX),
-      fbb.CreateVector(info.dynamic_resources, ResourceIndex_MAX));
+      fbb.CreateVector(info.dynamic_resources, ResourceIndex_MAX), false);
   fbb.Finish(message);
 
   int status = redisAsyncCommand(
@@ -1370,6 +1374,22 @@ void redis_local_scheduler_table_send_info(TableCallbackData *callback_data) {
     LOG_REDIS_DEBUG(db->context,
                     "error in redis_local_scheduler_table_send_info");
   }
+}
+
+void redis_local_scheduler_table_disconnect(DBHandle *db) {
+  flatbuffers::FlatBufferBuilder fbb;
+  LocalSchedulerInfoMessageBuilder builder(fbb);
+  builder.add_db_client_id(to_flatbuf(fbb, db->client));
+  builder.add_is_dead(true);
+  auto message = builder.Finish();
+  fbb.Finish(message);
+  redisReply *reply = (redisReply *) redisCommand(
+      db->sync_context, "PUBLISH local_schedulers %b", fbb.GetBufferPointer(),
+      fbb.GetSize());
+  CHECK(reply->type != REDIS_REPLY_ERROR);
+  CHECK(reply->type == REDIS_REPLY_INTEGER);
+  LOG_DEBUG("%" PRId64 " subscribers received this publish.\n", reply->integer);
+  freeReplyObject(reply);
 }
 
 void redis_driver_table_subscribe_callback(redisAsyncContext *c,

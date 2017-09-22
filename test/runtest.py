@@ -907,6 +907,44 @@ class PythonModeTest(unittest.TestCase):
         assert_equal(aref, np.array([0, 0]))
         assert_equal(bref, np.array([1, 0]))
 
+        # wait should return the first num_returns values passed in as the
+        # first list and the remaining values as the second list
+        num_returns = 5
+        object_ids = [ray.put(i) for i in range(20)]
+        ready, remaining = ray.wait(object_ids, num_returns=num_returns,
+                                    timeout=None)
+        assert_equal(ready, object_ids[:num_returns])
+        assert_equal(remaining, object_ids[num_returns:])
+
+        # Test actors in PYTHON_MODE.
+
+        @ray.remote
+        class PythonModeTestClass(object):
+            def __init__(self, array):
+                self.array = array
+
+            def set_array(self, array):
+                self.array = array
+
+            def get_array(self):
+                return self.array
+
+            def modify_and_set_array(self, array):
+                array[0] = -1
+                self.array = array
+
+        test_actor = PythonModeTestClass.remote(np.arange(10))
+        # Remote actor functions should return by value
+        assert_equal(test_actor.get_array.remote(), np.arange(10))
+
+        test_array = np.arange(10)
+        # Remote actor functions should not mutate arguments
+        test_actor.modify_and_set_array.remote(test_array)
+        assert_equal(test_array, np.arange(10))
+        # Remote actor functions should keep state
+        test_array[0] = -1
+        assert_equal(test_array, test_actor.get_array.remote())
+
         ray.worker.cleanup()
 
 
@@ -1661,10 +1699,10 @@ class GlobalStateAPI(unittest.TestCase):
         # Make sure the event log has the correct number of events.
         start_time = time.time()
         while time.time() - start_time < 10:
-            profiles = ray.global_state.task_profiles(start=0, end=time.time())
-            limited_profiles = ray.global_state.task_profiles(start=0,
-                                                              end=time.time(),
-                                                              num_tasks=1)
+            profiles = ray.global_state.task_profiles(
+                100, start=0, end=time.time())
+            limited_profiles = ray.global_state.task_profiles(1, start=0,
+                                                              end=time.time())
             if len(profiles) == num_calls and len(limited_profiles) == 1:
                 break
             time.sleep(0.1)
@@ -1729,7 +1767,8 @@ class GlobalStateAPI(unittest.TestCase):
         ray.get([actor.method.remote() for actor in actors])
 
         path = os.path.join("/tmp/ray_test_trace")
-        task_info = ray.global_state.task_profiles(start=0, end=time.time())
+        task_info = ray.global_state.task_profiles(
+            100, start=0, end=time.time())
         ray.global_state.dump_catapult_trace(path, task_info)
 
         # TODO(rkn): This test is not perfect because it does not verify that

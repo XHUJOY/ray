@@ -12,6 +12,16 @@ from ray.rllib.models.fcnet import FullyConnectedNetwork
 from ray.rllib.models.visionnet import VisionNetwork
 
 
+MODEL_CONFIGS = [
+    "conv_filters",
+    "downscale_factor",
+    "extra_frameskip",
+    "fcnet_activation",
+    "fcnet_hiddens",
+    "free_log_std"
+]
+
+
 class ModelCatalog(object):
     """Registry of default models and action distributions for envs.
 
@@ -21,6 +31,8 @@ class ModelCatalog(object):
         dist = dist_class(model.outputs)
         action_op = dist.sample()
     """
+
+    _registered_preprocessor = dict()
 
     @staticmethod
     def get_action_dist(action_space, dist_type=None):
@@ -66,8 +78,8 @@ class ModelCatalog(object):
 
         return FullyConnectedNetwork(inputs, num_outputs, options)
 
-    @staticmethod
-    def get_preprocessor(env_name, obs_shape):
+    @classmethod
+    def get_preprocessor(cls, env_name, obs_shape, options=dict()):
         """Returns a suitable processor for the given environment.
 
         Args:
@@ -81,12 +93,33 @@ class ModelCatalog(object):
         ATARI_OBS_SHAPE = (210, 160, 3)
         ATARI_RAM_OBS_SHAPE = (128,)
 
+        for k in options.keys():
+            if k not in MODEL_CONFIGS:
+                raise Exception(
+                    "Unknown config key `{}`, all keys: {}".format(
+                        k, MODEL_CONFIGS))
+
+        if env_name in cls._registered_preprocessor:
+            return cls._registered_preprocessor[env_name](options)
+
         if obs_shape == ATARI_OBS_SHAPE:
             print("Assuming Atari pixel env, using AtariPixelPreprocessor.")
-            return AtariPixelPreprocessor()
+            return AtariPixelPreprocessor(options)
         elif obs_shape == ATARI_RAM_OBS_SHAPE:
             print("Assuming Atari ram env, using AtariRamPreprocessor.")
-            return AtariRamPreprocessor()
+            return AtariRamPreprocessor(options)
 
         print("Non-atari env, not using any observation preprocessor.")
-        return NoPreprocessor()
+        return NoPreprocessor(options)
+
+    @classmethod
+    def register_preprocessor(cls, env_name, preprocessor_class):
+        """Register a preprocessor class for a specific environment.
+
+        Args:
+            env_name (str): Name of the gym env we register the
+                preprocessor for.
+            preprocessor_class (type):
+                Python class of the distribution.
+        """
+        cls._registered_preprocessor[env_name] = preprocessor_class
